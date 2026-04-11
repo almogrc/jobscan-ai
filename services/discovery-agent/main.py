@@ -21,6 +21,11 @@ def main():
             
         except Exception as e:
             print(f"❌ Error scanning {company_name}: {e}")
+    if all_new_jobs:
+        print(f"\n🎉 Boom! Scan completed successfully. Collected a total of {len(all_new_jobs)} jobs:")
+        print(json.dumps(all_new_jobs, indent=2, ensure_ascii=False))
+    else:
+        print("\n⚠️ No jobs found at all. Check the URLs or API limits.")
 
 if __name__ == "__main__":
     main()
