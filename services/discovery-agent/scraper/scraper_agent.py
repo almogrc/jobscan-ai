@@ -1,4 +1,5 @@
 import hashlib
+from datetime import datetime, timezone
 from firecrawl import Firecrawl
 from schemas import JobBoard
 
@@ -6,8 +7,10 @@ class ScraperAgent:
     def __init__(self, api_key: str):
         self.app = Firecrawl(api_key=api_key)
 
-    def scan_and_process_jobs(self, target_url: str, company_name: str) -> list[dict]:
+    def scan_and_process_jobs(self, target_url: str, company_name: str) -> tuple[list[dict], str]:
         print(f"[*] Agent starting scan for {company_name} at {target_url}...")
+        
+        scan_time = datetime.now(timezone.utc).isoformat()
         
         result = self.app.scrape(
             target_url,
@@ -37,9 +40,8 @@ class ScraperAgent:
                 "url": job.get("url"),
                 "location": job.get("location"),
                 "created_at": job.get("created_at"),
-                "job_hash": job_hash,
-                "should_delete": False
+                "job_hash": job_hash
             }
             processed_jobs.append(final_job)
             
-        return processed_jobs
+        return processed_jobs, scan_time

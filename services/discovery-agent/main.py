@@ -7,52 +7,55 @@ sys.path.append(root_dir)
 
 import json
 from scraper.scraper_agent import ScraperAgent
-
 from infrastructure.quque_system.pubsub_mock import LocalPubSub
-MOCK_DB_URLS = [
-    {"name": "Amazon", "url": "https://www.amazon.jobs/content/en/locations/israel/tel-aviv"},
-    {"name": "Anthropic", "url": "https://careers.checkpoint.com/index.php?q=&module=cpcareers&a=search&fa%5B%5D=country_ss%3AIsrael&sort="}
-]
+from infrastructure.db.db_operations import get_sites, process_scraped_site 
 
-FIRECRAWL_API_KEY = "fc-a3e7b8277fe64d4790ab67fcbe8cf181"
+FIRECRAWL_API_KEY = "fc-97fea0f266274fa2be9dd96fe2ca5497"
 
 def main():
-    
     links_pubsub = LocalPubSub()
     topic_name = "links"
 
-    for link in MOCK_DB_URLS:
-        links_pubsub.publish(topic_name,link)
-    print(f"✅ Loaded {len(MOCK_DB_URLS)} tasks into the queue.")
+    db_sites = get_sites()
+    
+    for site in db_sites:
+        links_pubsub.publish(topic_name, site)
+    print(f"✅ Loaded {len(db_sites)} active tasks into the queue.")
 
     agent = ScraperAgent(api_key=FIRECRAWL_API_KEY)
-    all_new_jobs = []
+    total_jobs_collected = 0
 
     while True:
-        message=links_pubsub.pull(topic_name)
+        message = links_pubsub.pull(topic_name)
 
         if message is None:
             print("📭 Queue is empty. Agent going to sleep.")
             break
 
+        site_id = message["id"]
         company_name = message["name"]
         url = message["url"]
 
         try:
-            jobs = agent.scan_and_process_jobs(url, company_name)
-            all_new_jobs.extend(jobs)
+            jobs, scanned_at = agent.scan_and_process_jobs(url, company_name)
+            
+            if jobs:
+                process_scraped_site(site_id, jobs, scanned_at)
+                total_jobs_collected += len(jobs)
+            else:
+                print(f"⚠️ No jobs found for {company_name}")
 
             links_pubsub.acknowledge(topic_name)
-            print(f"✅ Acknowledged and cleared {company_name} from queue.")
+            print(f"✅ Acknowledged, Saved to DB, and cleared {company_name} from queue.")
             
         except Exception as e:
-            print(f"❌ Error scanning {company_name}: {e}")
-    if all_new_jobs:
-        print(f"\n🎉 Boom! Scan completed successfully. Collected a total of {len(all_new_jobs)} jobs:")
-        print(json.dumps(all_new_jobs, indent=2, ensure_ascii=False))
+            print(f"❌ Error scanning/saving {company_name}: {e}")
+            links_pubsub.nack(topic_name, message)
+            
+    if total_jobs_collected > 0:
+        print(f"\n🎉 Boom! Scan completed successfully. Collected & Saved {total_jobs_collected} jobs.")
     else:
-        print("\n⚠️ No jobs found at all. Check the URLs or API limits.")
+        print("\n⚠️ No jobs found or saved.")
 
 if __name__ == "__main__":
     main()
-
