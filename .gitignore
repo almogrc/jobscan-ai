@@ -221,3 +221,6 @@ obj/
 # OS 
 .DS_Store
 Thumbs.db
+
+# local DB
+*.db
