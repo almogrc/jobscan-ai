@@ -224,3 +224,6 @@ Thumbs.db
 
 # local DB
 *.db
+
+# local temp files
+*.temp

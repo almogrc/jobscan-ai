@@ -30,7 +30,6 @@ def process_scraped_site(site_id: int, scraped_jobs: list[dict], scanned_at_str:
         
         for job_data in scraped_jobs:
             existing_job = db.query(Job).filter(Job.url == job_data["url"]).first()
-            
             if existing_job:
                 existing_job.last_seen = run_timestamp 
             else:
@@ -44,7 +43,17 @@ def process_scraped_site(site_id: int, scraped_jobs: list[dict], scanned_at_str:
                 db.add(new_job)
                 
         db.commit()
-        
+
+        expired_jobs = db.query(Job).filter(
+            Job.site_id == site_id,
+            Job.last_seen < run_timestamp.date()
+        ).all()
+
+        if expired_jobs:
+            print(f"🧹 Found {len(expired_jobs)} expired jobs for site {site_id}:")
+            for job in expired_jobs:
+                print(f"   [-] Removingּ: {job.title}")
+
         deleted_count = db.query(Job).filter(
             Job.site_id == site_id,
             Job.last_seen < run_timestamp.date()
