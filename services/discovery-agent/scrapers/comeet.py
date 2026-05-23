@@ -28,6 +28,7 @@ import asyncio
 import random
 
 import aiohttp
+from bs4 import BeautifulSoup
 
 # ===========================================================================
 # API constants
@@ -36,6 +37,9 @@ import aiohttp
 COMEET_API_TEMPLATE = (
     "https://www.comeet.co/careers-api/2.0/company/{company_id}/positions"
     "?token={token}"
+    "&details=true"     # ← required to receive description fields;
+                        #   omitting this returns positions without any
+                        #   job description or requirements content
 )
 
 # Israel country code as used by Comeet's API.
@@ -80,6 +84,13 @@ def _parse_target_url(target_url: str) -> tuple[str, str] | None:
     return company_id, token
 
 
+def _strip_html(html: str) -> str:
+    """Strip HTML tags from a Comeet description field → plain text."""
+    if not html:
+        return ""
+    return BeautifulSoup(html, "lxml").get_text(separator=" ", strip=True)
+
+
 # ===========================================================================
 # Field mapping
 # ===========================================================================
@@ -88,16 +99,13 @@ def _map_job(job: dict) -> dict | None:
     """
     Convert one Comeet API job object into our internal schema dict.
 
-    Returns None if the job is missing the minimum required fields
-    (title + url), so the caller skips it without crashing.
+    DESCRIPTION FIELDS (available when &details=true is set):
+      The response includes a `details` array of section objects.
+      Each section has a `name` (e.g. "Job Description", "Requirements")
+      and a `value` containing HTML content.
+      We strip all HTML and concatenate sections into one plain-text string.
 
-    URL FALLBACK LOGIC:
-        url_active_page  — the company's own careers-page URL (preferred).
-                           May be absent if the company hasn't configured it.
-        url_comeet_hosted_page — Comeet's own hosted URL; always present.
-
-    We prefer the company's own URL because it's more stable and more
-    useful to a job-seeker clicking through from a notification.
+    Returns None if the job is missing the minimum required fields.
     """
     title = job.get("name", "").strip()
 
@@ -108,17 +116,32 @@ def _map_job(job: dict) -> dict | None:
     ).strip()
 
     if not title or not url:
-        return None     # skip incomplete records
+        return None
 
     location_obj = job.get("location") or {}
     location     = location_obj.get("name", "").strip()
     job_hash     = str(job.get("uid", "")).strip()
 
+    # Extract description from the `details` array.
+    # Each element: {"name": "Job Description", "value": "<p>...</p>", ...}
+    # We concatenate all sections in order to form one complete description.
+    details      = job.get("details") or []
+    desc_parts   = []
+    for section in details:
+        heading = (section.get("name") or "").strip()
+        html    = (section.get("value") or "").strip()
+        if heading:
+            desc_parts.append(heading)
+        if html:
+            desc_parts.append(_strip_html(html))
+    description = " ".join(desc_parts).strip()
+
     return {
-        "title":    title,
-        "url":      url,
-        "location": location,
-        "job_hash": job_hash,
+        "title":       title,
+        "url":         url,
+        "location":    location,
+        "job_hash":    job_hash,
+        "description": description,
     }
 
 
@@ -209,7 +232,8 @@ async def scrape_comeet(target_url: str) -> list[dict]:
 
     for job in raw_jobs:
         # Country filter — IL only
-        country = job.get("location", {}).get("country", "")
+        location_obj = job.get("location") or {}
+        country      = location_obj.get("country", "")
         if country != TARGET_COUNTRY:
             continue
 

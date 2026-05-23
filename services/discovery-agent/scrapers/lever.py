@@ -1,52 +1,49 @@
 """
 scrapers/lever.py — Generic async scraper for the Lever ATS public API.
 
-Works for ANY company hosted on Lever — not just Cloudinary.
-The company slug (e.g. "cloudinary") is stored in TargetSite.base_url,
-so adding a new Lever company = one new DB row, zero code changes.
+DESCRIPTION STRATEGY — SINGLE FETCH (no double-fetch needed):
+  Lever's v0 `?mode=json` list endpoint already returns the full description
+  on every posting object. Two fields are available:
+    descriptionPlain — pre-stripped plain text  ← preferred, use directly
+    description      — raw HTML string          ← fallback, strip with BS4
 
-Public API (the only symbol worker.py needs):
+  Unlike Greenhouse, there is NO additional data gained by fetching individual
+  job endpoints. The individual endpoint (/v0/postings/{slug}/{id}) returns
+  identical fields to the list. Double-fetching would cost N extra requests
+  for zero benefit.
+
+  Source: Lever's official postings API documentation + README examples.
+
+Public API:
     await scrape_lever(target_url: str) -> list[dict]
 
-`target_url` format (stored in TargetSite.base_url):
-    Just the company slug as it appears in the Lever URL.
-    e.g.  "cloudinary"   →  api.lever.co/v0/postings/cloudinary?mode=json
+`target_url` (stored in TargetSite.base_url):
+    The company slug from the Lever URL.
+    e.g. "cloudinary"  →  api.lever.co/v0/postings/cloudinary?mode=json
 
-    To find the slug for any company:
-      1. Go to their careers page
-      2. Open DevTools → Network tab
-      3. Look for a request to api.lever.co/v0/postings/{SLUG}
-      OR search:  site:jobs.lever.co "company name"
+Return schema (one dict per job):
+    title       : str  — posting.text
+    url         : str  — posting.hostedUrl
+    location    : str  — posting.categories.location
+    job_hash    : str  — posting.id  (UUID)
+    description : str  — posting.descriptionPlain  (or HTML-stripped fallback)
 
-Each returned dict has exactly these keys (matching the Job model schema):
-    title     : str  — posting.text
-    url       : str  — posting.hostedUrl  (the public job page)
-    location  : str  — posting.categories.location
-    job_hash  : str  — posting.id  (UUID string, e.g. "a1b2c3d4-...")
-
-Only Israel-based postings are returned.
-Israel is detected by checking (in priority order):
-    1. posting.country == "IL"          (explicit country code, most reliable)
-    2. "israel" in categories.location  (location string fallback)
-    3. "tel aviv" in categories.location
-
-WHY NO TOKEN?
-Lever's v0 API is fully public — no authentication required.
-The same endpoint your browser hits when loading a company's jobs page.
+Only Israeli jobs are returned.
 
 Dependencies:
-    pip install aiohttp
+    pip install aiohttp beautifulsoup4 lxml
 """
 
 import asyncio
 
 import aiohttp
+from bs4 import BeautifulSoup
 
 # ===========================================================================
 # API
 # ===========================================================================
 
-LEVER_API_TEMPLATE = "https://api.lever.co/v0/postings/{slug}?mode=json"
+LEVER_API = "https://api.lever.co/v0/postings/{slug}?mode=json"
 
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
@@ -60,78 +57,143 @@ _HEADERS = {
     ),
 }
 
-# Strings we look for inside the location field (case-insensitive) when the
-# top-level `country` field is absent or empty — which happens on older
-# Lever integrations that pre-date the country field.
-_IL_LOCATION_KEYWORDS = ("israel", "tel aviv", "tel-aviv", "tlv", "herzliya",
-                          "raanana", "ra'anana", "petah tikva", "beer sheva")
-
-
 # ===========================================================================
-# Israel detection
+# Israel location keywords (identical to greenhouse.py for consistency)
 # ===========================================================================
 
-def _is_israel(posting: dict) -> bool:
-    """
-    Return True if this job posting is based in Israel.
+_IL_KEYWORDS = (
+    "israel",
+    "tel aviv",
+    "tel-aviv",
+    "tlv",
+    "herzliya",
+    "herzelia",
+    "haifa",
+    "petah tikva",
+    "petach tikva",
+    "ra'anana",
+    "raanana",
+    "netanya",
+    "jerusalem",
+    "ramat gan",
+    "kfar saba",
+    "rishon",
+    "rehovot",
+    "beer sheva",
+    "be'er sheva",
+    "hod hasharon",
+    "givatayim",
+    "holon",
+    "bnei brak",
+)
 
-    Priority:
-      1. posting.country == "IL"             — explicit, always trust this
-      2. keyword match in categories.location — fallback for older postings
 
-    WHY TWO CHECKS?
-    Lever added the top-level `country` field relatively recently. Postings
-    created before that field existed (or companies that haven't re-saved
-    their postings) won't have it set. The location-string fallback catches
-    those without false-positives on generic "Remote" postings.
+def _is_israel_posting(posting: dict) -> bool:
     """
-    # Primary — explicit country code
+    Two-layer Israel check:
+      1. posting.country == "IL"         — explicit code, most reliable
+      2. keyword match in location string — fallback for older postings
+         that pre-date the country field
+    """
     country = (posting.get("country") or "").strip().upper()
     if country == "IL":
         return True
 
-    # Fallback — location string keyword match
-    location = (
-        posting.get("categories", {}).get("location") or ""
-    ).lower()
-    return any(kw in location for kw in _IL_LOCATION_KEYWORDS)
+    location = (posting.get("categories", {}).get("location") or "").lower()
+    return any(kw in location for kw in _IL_KEYWORDS)
+
+
+# ===========================================================================
+# HTML → plain text  (used only when descriptionPlain is absent)
+# ===========================================================================
+
+def _strip_html(html: str) -> str:
+    """
+    Strip HTML tags from a Lever `description` field.
+
+    This is a fallback path — Lever almost always populates `descriptionPlain`
+    already. We only reach here if a posting has `description` but no
+    `descriptionPlain`, which can happen on very old or manually-created postings.
+
+    WHY lxml?
+    Lever description HTML is well-formed (WYSIWYG editor output). lxml
+    parses it correctly and is faster than html.parser.
+    """
+    if not html:
+        return ""
+    return BeautifulSoup(html, "lxml").get_text(separator=" ", strip=True)
 
 
 # ===========================================================================
 # Field mapping
 # ===========================================================================
 
+def _extract_description(posting: dict) -> str:
+    """
+    Extract the cleanest available description from a Lever posting.
+
+    Priority:
+      1. descriptionPlain — already plain text, no processing needed
+      2. description      — HTML, strip with BeautifulSoup
+      3. lists            — structured sections (role/requirements/etc.),
+                            concatenated as a last resort
+      4. ""               — empty if nothing is available
+
+    WHY CHECK `lists` AS FALLBACK?
+    Some companies write their entire job description inside `lists` (an array
+    of {text, content} objects for sections like "About the Role", "Requirements")
+    and leave `description` empty. Concatenating them gives usable content.
+    """
+    # Path 1 — pre-stripped plain text
+    plain = (posting.get("descriptionPlain") or "").strip()
+    if plain:
+        return plain
+
+    # Path 2 — strip HTML description
+    html = (posting.get("description") or "").strip()
+    if html:
+        stripped = _strip_html(html)
+        if stripped:
+            return stripped
+
+    # Path 3 — concatenate structured sections from `lists`
+    sections = posting.get("lists") or []
+    if sections:
+        parts = []
+        for section in sections:
+            heading = (section.get("text") or "").strip()
+            content = _strip_html(section.get("content") or "")
+            if heading:
+                parts.append(heading)
+            if content:
+                parts.append(content)
+        combined = " ".join(parts).strip()
+        if combined:
+            return combined
+
+    return ""
+
+
 def _map_posting(posting: dict) -> dict | None:
     """
-    Convert one Lever API posting object into our internal job schema.
+    Convert one Lever posting object to our internal job schema.
+    Returns None if the minimum required fields (title + url) are missing.
 
-    Returns None if the posting is missing the minimum required fields
-    (title + url), so the caller can skip it cleanly.
-
-    FIELD NOTES:
-      text        — the job title (Lever calls it "text", not "title")
-      hostedUrl   — the canonical public job page URL
-                    (prefer over applyUrl which goes straight to application form)
-      id          — a UUID; we use it as job_hash for deduplication
-      categories.location — human-readable location string
+    NO internal ID injection needed (unlike Greenhouse) because we extract
+    all data including description from this single object — no second fetch.
     """
-    title    = (posting.get("text") or "").strip()
-    url      = (posting.get("hostedUrl") or "").strip()
+    title = (posting.get("text") or "").strip()
+    url   = (posting.get("hostedUrl") or "").strip()
 
     if not title or not url:
         return None
 
-    location = (
-        posting.get("categories", {}).get("location") or ""
-    ).strip()
-
-    job_hash = (posting.get("id") or "").strip()
-
     return {
-        "title":    title,
-        "url":      url,
-        "location": location,
-        "job_hash": job_hash,
+        "title":       title,
+        "url":         url,
+        "location":    (posting.get("categories", {}).get("location") or "").strip(),
+        "job_hash":    (posting.get("id") or "").strip(),
+        "description": _extract_description(posting),
     }
 
 
@@ -141,31 +203,27 @@ def _map_posting(posting: dict) -> dict | None:
 
 async def scrape_lever(target_url: str) -> list[dict]:
     """
-    Fetch all open Israel-based postings for a Lever-hosted company.
+    Fetch all open Israel-based jobs for a Lever-hosted company.
+
+    Single HTTP request — description is included in the list response.
+    No double-fetch, no concurrency management needed.
 
     Args:
-        target_url: The company slug stored in TargetSite.base_url.
-                    e.g. "cloudinary"
+        target_url: Company slug, e.g. "cloudinary"
 
     Returns:
-        List of job dicts [{title, url, location, job_hash}, ...].
-        Returns an empty list (never raises) so the worker acks/nacks
-        cleanly based on return value.
-
-    PAGINATION:
-        Lever's v0 API with ?mode=json returns ALL postings in one
-        response — it is not paginated. We filter for Israel client-side.
+        List of fully-populated job dicts (title, url, location, job_hash,
+        description). Always returns [] on any error — never raises.
     """
     slug = target_url.strip().strip("/")
 
     if not slug:
-        print("[Lever] ERROR: target_url (company slug) is empty. Returning [].")
+        print("[Lever] ERROR: company slug is empty.")
         return []
 
-    api_url = LEVER_API_TEMPLATE.format(slug=slug)
-    print(f"[Lever] Fetching postings for company slug='{slug}'...")
+    api_url = LEVER_API.format(slug=slug)
+    print(f"[Lever] Fetching postings for slug='{slug}'...")
 
-    # --- Fetch ---
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -174,46 +232,37 @@ async def scrape_lever(target_url: str) -> list[dict]:
                 timeout=_REQUEST_TIMEOUT,
             ) as resp:
                 resp.raise_for_status()
-                postings: list[dict] = await resp.json(content_type=None)
+                postings = await resp.json(content_type=None)
 
     except aiohttp.ClientResponseError as e:
-        print(
-            f"[Lever] HTTP {e.status} for slug='{slug}': {e.message}. "
-            f"{'Slug may be wrong or company moved ATS.' if e.status == 404 else ''}"
-        )
+        print(f"[Lever] HTTP {e.status} for slug='{slug}': {e.message}"
+              + (" (wrong slug?)" if e.status == 404 else ""))
         return []
     except aiohttp.ClientConnectionError as e:
         print(f"[Lever] Connection error for slug='{slug}': {e}")
         return []
     except asyncio.TimeoutError:
-        print(f"[Lever] Request timed out for slug='{slug}'.")
+        print(f"[Lever] Timeout for slug='{slug}'.")
         return []
     except Exception as e:
         print(f"[Lever] Unexpected error for slug='{slug}': {e}")
         return []
 
     if not isinstance(postings, list):
-        print(
-            f"[Lever] Unexpected response shape for slug='{slug}': "
-            f"expected JSON array, got {type(postings).__name__}."
-        )
+        print(f"[Lever] Unexpected response shape for slug='{slug}': "
+              f"expected JSON array, got {type(postings).__name__}.")
         return []
 
-    print(f"[Lever] {len(postings)} total postings received. Filtering for Israel...")
+    print(f"[Lever] {len(postings)} total postings. Filtering for Israel...")
 
-    # --- Filter + map ---
     all_jobs: list[dict] = []
-
     for posting in postings:
-        if not _is_israel(posting):
+        if not _is_israel_posting(posting):
             continue
-        job = _map_posting(posting)
-        if job is None:
+        mapped = _map_posting(posting)
+        if mapped is None:
             continue
-        all_jobs.append(job)
+        all_jobs.append(mapped)
 
-    print(
-        f"[Lever] Done. {len(all_jobs)} Israel-based posting(s) found "
-        f"for slug='{slug}'."
-    )
+    print(f"[Lever] Done. {len(all_jobs)} Israel job(s) for slug='{slug}'.")
     return all_jobs
