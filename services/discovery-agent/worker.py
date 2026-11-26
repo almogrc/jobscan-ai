@@ -12,20 +12,29 @@ module under scrapers/. To add a new site, add one import and one `if`
 branch in scraper_factory() — nothing else changes.
 
 Architecture:
-  process_message()        ← Pub/Sub callback (sync, runs in thread pool)
-    └─ scraper_factory()   ← async router
-         ├─ scrape_checkpoint()   from scrapers.checkpoint
-         └─ scrape_amazon()       from scrapers.amazon
+  process_message(message)       ← Pub/Sub callback (runs in the client's thread pool)
+    └─ handle_site_message(data)  ← transport-free: returns ACK or NACK
+         ├─ scraper_factory()     ← async router
+         └─ process_scraped_site()
+
+handle_site_message() doesn't know about Pub/Sub objects, so the same code
+can later sit behind a Cloud Run push endpoint (2xx = ack, 5xx = nack).
 
 ACK CONTRACT:
-  message.ack()  → ONLY after process_scraped_site() commits successfully
-  message.nack() → on ANY exception; Pub/Sub will redeliver the message
+  ACK   → results committed to the DB (including an empty run)
+  ACK   → the message can never succeed: bad JSON, unknown site.
+          Redelivering it only loops forever (there is no dead-letter
+          topic locally), so we log it loudly and drop it.
+  NACK  → the scraper raised, or the DB write failed. Pub/Sub redelivers.
 
-Usage:
-    python -m infrastructure.queue_system.worker
+Usage (from services/discovery-agent):
+    python worker.py
+Env:
+    WORKER_CONCURRENCY   messages processed at the same time (default 4)
 """
 
 import asyncio
+import enum
 import json
 import os
 import sys
@@ -38,8 +47,6 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir    = os.path.abspath(os.path.join(current_dir, "..", ".."))
 sys.path.insert(0, root_dir)
 
-os.environ.setdefault("PUBSUB_EMULATOR_HOST", "localhost:8085")
-
 # ---------------------------------------------------------------------------
 # Internal imports  (after path bootstrap)
 # ---------------------------------------------------------------------------
@@ -49,10 +56,19 @@ from scrapers.comeet import scrape_comeet                            # noqa: E40
 from scrapers.lever import scrape_lever                              # noqa: E402
 from scrapers.greenhouse import scrape_greenhouse                    # noqa: E402
 from infrastructure.queue_system.gcp_pubsub import GCPPubSubClient  # noqa: E402
-from infrastructure.db.db_operations import process_scraped_site    # noqa: E402
+from infrastructure.db.db_operations import (                        # noqa: E402
+    ensure_schema,
+    process_scraped_site,
+    record_site_run,
+)
 
 TOPIC_NAME = "links-topic"
 SUB_NAME   = "scraper-worker-sub"
+
+
+class Outcome(enum.Enum):
+    ACK  = "ack"
+    NACK = "nack"
 
 
 # ===========================================================================
@@ -64,20 +80,13 @@ async def scraper_factory(site_name: str, target_url: str) -> list[dict] | None:
     Map site_name -> the correct scraper coroutine and return its results.
 
     Return values:
-      list[dict]  — scraped jobs (may be empty for placeholder sites)
-      None        — site_name is unknown; caller must nack (not redeliver loop)
-
-    WHY RETURN None FOR UNKNOWN SITES (not raise)?
-    Raising triggers a nack and Pub/Sub redelivery — correct for transient
-    failures like network errors. But an unknown site_name is a configuration
-    bug; redelivery won't fix it and will hammer the queue. Returning None
-    signals "nack this once and log a warning" without an infinite loop.
+      list[dict]  — scraped jobs (may be empty)
+      None        — site_name is unknown (a configuration bug, not a transient error)
 
     HOW TO ADD A NEW SITE:
       1. Create scrapers/newsite.py  with  async def scrape_newsite(url) -> list[dict]
       2. Add one import at the top of this file
       3. Add one `if name == "newsite":` branch below
-      That's it. process_message() does not change.
     """
     name = site_name.lower().strip()
 
@@ -101,78 +110,64 @@ async def scraper_factory(site_name: str, target_url: str) -> list[dict] | None:
 
 
 # ===========================================================================
-# Pub/Sub callback
+# Message handling (no Pub/Sub objects in here)
 # ===========================================================================
 
-def process_message(message) -> None:
-    """
-    Pub/Sub push callback. Called from the subscriber's background thread.
-
-    WHY asyncio.run() HERE?
-    The synchronous Pub/Sub client invokes this function from a thread pool.
-    Our scrapers are async (Playwright). asyncio.run() creates a fresh event
-    loop per message — safe because messages are processed sequentially.
-    If we later move to concurrent processing, we'd share a single event loop
-    instead, but sequential is correct and simple for now.
-    """
-
+def handle_site_message(data: bytes) -> Outcome:
     # --- 1. Decode payload ---
     try:
-        site_data = json.loads(message.data.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        # A message we can never decode is not worth redelivering.
-        # Nack once and move on — it will go to the dead-letter topic if configured.
-        print(f"[Worker] ERROR: Cannot decode message payload: {e}")
-        message.nack()
-        return
+        site_data = json.loads(data.decode("utf-8"))
+        site_id   = int(site_data["id"])
+        site_name = str(site_data.get("name", ""))
+        site_url  = str(site_data.get("url", ""))
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as e:
+        print(f"[Worker] ERROR: Dropping a message that can't be decoded: {e}")
+        return Outcome.ACK
 
-    site_id   = site_data.get("id")
-    site_name = site_data.get("name", "")
-    site_url  = site_data.get("url", "")
+    label = site_data.get("company") or site_name
+    print(f"[Worker] ← Received: '{label}' (site_id={site_id}, scraper={site_name})")
 
-    print(f"[Worker] ← Received: '{site_name}' (site_id={site_id})")
-
-    # --- 2. Route to scraper ---
+    # --- 2. Scrape ---
     try:
         jobs = asyncio.run(scraper_factory(site_name, site_url))
     except Exception as e:
-        print(f"[Worker] ERROR: Scraper raised an exception for '{site_name}': {e}")
-        message.nack()
-        return
+        print(f"[Worker] ERROR: Scraper raised for '{label}': {e}")
+        try:
+            record_site_run(site_id, "error", 0, f"{type(e).__name__}: {e}")
+        except Exception as db_error:
+            print(f"[Worker] (could not record the error: {db_error})")
+        return Outcome.NACK
 
-    # --- 3. Handle factory return value ---
     if jobs is None:
-        # Unknown site — nack without logging an exception (already warned above)
-        message.nack()
-        return
+        print(f"[Worker] ERROR: Dropping '{label}': unknown scraper '{site_name}'. Fix target_sites.name.")
+        return Outcome.ACK
 
-    if not jobs:
-        # Placeholder (Amazon) or genuinely zero results — ack cleanly
-        print(f"[Worker] No jobs to save for '{site_name}'. Acking.")
-        message.ack()
-        return
-
-    # --- 4. Persist to DB ---
+    # --- 3. Persist (also for an empty run: it records the run and lets
+    #        sync_plan close jobs that haven't been seen for a week) ---
     #
-    # All jobs in a single run share ONE scanned_at timestamp. This matters
-    # because process_scraped_site() deletes jobs where last_seen < this
-    # timestamp. If we stamped each job individually, the first job written
-    # would have an earlier last_seen than the last, and the cleanup query
-    # could incorrectly prune jobs from the same run.
+    # All jobs in a single run share ONE scanned_at timestamp.
     scanned_at = datetime.now(timezone.utc).isoformat()
-
     try:
-        process_scraped_site(
-            site_id=site_id,
-            scraped_jobs=jobs,
-            scanned_at_str=scanned_at,
-        )
-        message.ack()   # ← THE ONLY ack() CALL IN THIS FUNCTION
-        print(f"[Worker] ✓ '{site_name}': {len(jobs)} jobs committed. Message acked.")
-
+        process_scraped_site(site_id=site_id, scraped_jobs=jobs, scanned_at_str=scanned_at)
     except Exception as e:
-        print(f"[Worker] ERROR: DB commit failed for '{site_name}': {e}")
-        message.nack()  # Pub/Sub redelivers; the scrape work is not lost
+        print(f"[Worker] ERROR: DB commit failed for '{label}': {e}")
+        return Outcome.NACK
+
+    print(f"[Worker] ✓ '{label}': {len(jobs)} job(s) processed.")
+    return Outcome.ACK
+
+
+def process_message(message) -> None:
+    """
+    Pub/Sub callback. The client calls it from a thread pool, so several
+    messages run at the same time (capped by WORKER_CONCURRENCY).
+    asyncio.run() gives each call its own event loop in its own thread.
+    """
+    outcome = handle_site_message(message.data)
+    if outcome is Outcome.ACK:
+        message.ack()
+    else:
+        message.nack()
 
 
 # ===========================================================================
@@ -181,14 +176,16 @@ def process_message(message) -> None:
 
 def run_worker() -> None:
     print("[Worker] Starting up...")
+    ensure_schema()
     pubsub = GCPPubSubClient()
 
     # Ensure topic + subscription exist even if producer hasn't run yet.
     # setup_topic_and_sub() is idempotent — safe to call on every startup.
     pubsub.setup_topic_and_sub(TOPIC_NAME, SUB_NAME)
 
-    print(f"[Worker] Listening on '{SUB_NAME}'. Press Ctrl+C to stop.")
-    future = pubsub.listen(SUB_NAME, process_message)
+    concurrency = int(os.getenv("WORKER_CONCURRENCY", "4"))
+    print(f"[Worker] Listening on '{SUB_NAME}' (up to {concurrency} at a time). Press Ctrl+C to stop.")
+    future = pubsub.listen(SUB_NAME, process_message, max_messages=concurrency)
 
     try:
         future.result()          # blocks until keyboard interrupt or fatal error

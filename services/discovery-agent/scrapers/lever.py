@@ -2,10 +2,14 @@
 scrapers/lever.py — Generic async scraper for the Lever ATS public API.
 
 DESCRIPTION STRATEGY — SINGLE FETCH (no double-fetch needed):
-  Lever's v0 `?mode=json` list endpoint already returns the full description
-  on every posting object. Two fields are available:
-    descriptionPlain — pre-stripped plain text  ← preferred, use directly
-    description      — raw HTML string          ← fallback, strip with BS4
+  Lever's v0 `?mode=json` list endpoint already returns every part of the
+  posting. The text is split across THREE fields (Lever's postings-api README):
+    descriptionPlain — opening + body as plain text
+    lists            — "extra lists (such as requirements, benefits, etc.)",
+                       [{text: heading, content: HTML <li> items}]
+    additionalPlain  — optional closing text
+  The requirements usually live in `lists`, so all three are joined.
+  (The old version used descriptionPlain alone and dropped the requirements.)
 
   Unlike Greenhouse, there is NO additional data gained by fetching individual
   job endpoints. The individual endpoint (/v0/postings/{slug}/{id}) returns
@@ -26,7 +30,7 @@ Return schema (one dict per job):
     url         : str  — posting.hostedUrl
     location    : str  — posting.categories.location
     job_hash    : str  — posting.id  (UUID)
-    description : str  — posting.descriptionPlain  (or HTML-stripped fallback)
+    description : str  — descriptionPlain + lists + additionalPlain, as plain text
 
 Only Israeli jobs are returned.
 
@@ -37,7 +41,8 @@ Dependencies:
 import asyncio
 
 import aiohttp
-from bs4 import BeautifulSoup
+
+from scrapers.common import html_to_text, is_israel_location
 
 # ===========================================================================
 # API
@@ -57,36 +62,10 @@ _HEADERS = {
     ),
 }
 
-# ===========================================================================
-# Israel location keywords (identical to greenhouse.py for consistency)
-# ===========================================================================
 
-_IL_KEYWORDS = (
-    "israel",
-    "tel aviv",
-    "tel-aviv",
-    "tlv",
-    "herzliya",
-    "herzelia",
-    "haifa",
-    "petah tikva",
-    "petach tikva",
-    "ra'anana",
-    "raanana",
-    "netanya",
-    "jerusalem",
-    "ramat gan",
-    "kfar saba",
-    "rishon",
-    "rehovot",
-    "beer sheva",
-    "be'er sheva",
-    "hod hasharon",
-    "givatayim",
-    "holon",
-    "bnei brak",
-)
-
+# ===========================================================================
+# Israel filter
+# ===========================================================================
 
 def _is_israel_posting(posting: dict) -> bool:
     """
@@ -99,29 +78,8 @@ def _is_israel_posting(posting: dict) -> bool:
     if country == "IL":
         return True
 
-    location = (posting.get("categories", {}).get("location") or "").lower()
-    return any(kw in location for kw in _IL_KEYWORDS)
-
-
-# ===========================================================================
-# HTML → plain text  (used only when descriptionPlain is absent)
-# ===========================================================================
-
-def _strip_html(html: str) -> str:
-    """
-    Strip HTML tags from a Lever `description` field.
-
-    This is a fallback path — Lever almost always populates `descriptionPlain`
-    already. We only reach here if a posting has `description` but no
-    `descriptionPlain`, which can happen on very old or manually-created postings.
-
-    WHY lxml?
-    Lever description HTML is well-formed (WYSIWYG editor output). lxml
-    parses it correctly and is faster than html.parser.
-    """
-    if not html:
-        return ""
-    return BeautifulSoup(html, "lxml").get_text(separator=" ", strip=True)
+    location = (posting.get("categories") or {}).get("location") or ""
+    return is_israel_location(location)
 
 
 # ===========================================================================
@@ -130,48 +88,31 @@ def _strip_html(html: str) -> str:
 
 def _extract_description(posting: dict) -> str:
     """
-    Extract the cleanest available description from a Lever posting.
-
-    Priority:
-      1. descriptionPlain — already plain text, no processing needed
-      2. description      — HTML, strip with BeautifulSoup
-      3. lists            — structured sections (role/requirements/etc.),
-                            concatenated as a last resort
-      4. ""               — empty if nothing is available
-
-    WHY CHECK `lists` AS FALLBACK?
-    Some companies write their entire job description inside `lists` (an array
-    of {text, content} objects for sections like "About the Role", "Requirements")
-    and leave `description` empty. Concatenating them gives usable content.
+    Join every text part of a Lever posting, in page order:
+      1. descriptionPlain (or the HTML `description`)   — opening + body
+      2. lists                                           — "Requirements", "What you'll do" ...
+      3. additionalPlain (or the HTML `additional`)      — closing text
+    One part per line, so the matcher sees each requirement on its own line.
     """
-    # Path 1 — pre-stripped plain text
-    plain = (posting.get("descriptionPlain") or "").strip()
-    if plain:
-        return plain
+    parts: list[str] = []
 
-    # Path 2 — strip HTML description
-    html = (posting.get("description") or "").strip()
-    if html:
-        stripped = _strip_html(html)
-        if stripped:
-            return stripped
+    body = (posting.get("descriptionPlain") or "").strip() or html_to_text(posting.get("description") or "")
+    if body:
+        parts.append(body)
 
-    # Path 3 — concatenate structured sections from `lists`
-    sections = posting.get("lists") or []
-    if sections:
-        parts = []
-        for section in sections:
-            heading = (section.get("text") or "").strip()
-            content = _strip_html(section.get("content") or "")
-            if heading:
-                parts.append(heading)
-            if content:
-                parts.append(content)
-        combined = " ".join(parts).strip()
-        if combined:
-            return combined
+    for section in posting.get("lists") or []:
+        heading = (section.get("text") or "").strip()
+        content = html_to_text(section.get("content") or "")
+        if heading:
+            parts.append(heading)
+        if content:
+            parts.append(content)
 
-    return ""
+    closing = (posting.get("additionalPlain") or "").strip() or html_to_text(posting.get("additional") or "")
+    if closing:
+        parts.append(closing)
+
+    return "\n".join(parts)
 
 
 def _map_posting(posting: dict) -> dict | None:
@@ -191,7 +132,7 @@ def _map_posting(posting: dict) -> dict | None:
     return {
         "title":       title,
         "url":         url,
-        "location":    (posting.get("categories", {}).get("location") or "").strip(),
+        "location":    ((posting.get("categories") or {}).get("location") or "").strip(),
         "job_hash":    (posting.get("id") or "").strip(),
         "description": _extract_description(posting),
     }

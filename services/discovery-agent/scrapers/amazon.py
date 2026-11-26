@@ -13,8 +13,13 @@ Each dict has exactly these keys (matching the Job model schema):
 Strategy: HTTP POST to Amazon's internal jobs search API using aiohttp.
 No browser / Playwright needed — this is a clean JSON API.
 
-⚠️  IMPORTANT — CREDENTIALS WILL EXPIRE:
-    SESSION_COOKIES and API_KEY below come from a live browser session.
+⚠️  IMPORTANT — CREDENTIALS WILL EXPIRE, AND THEY ARE NOT IN THE CODE:
+    The cookies and API key are read from two environment variables:
+        AMAZON_JOBS_COOKIES   — the full `Cookie:` header value
+        AMAZON_JOBS_API_KEY   — the `x-api-key:` header value
+    (They used to be pasted into this file, which is in a public repo.)
+    If either is missing the scraper logs it and returns [].
+    They come from a live browser session.
     Session cookies typically expire within hours to days.
     API_KEY may be rotated by Amazon periodically.
     When requests start returning 401/403 or empty results:
@@ -22,34 +27,22 @@ No browser / Playwright needed — this is a clean JSON API.
          in your browser with DevTools → Network tab open.
       2. Trigger any search/filter action.
       3. Find the POST to /api/jobs/search, copy the Cookie header and
-         x-api-key header, and paste them into the constants below.
+         x-api-key header, and put them in your .env / Secret Manager.
 """
 
 import asyncio
+import os
 import random
 from copy import deepcopy
 
 import aiohttp
 
 # ===========================================================================
-# Credentials  ← UPDATE HERE WHEN SESSIONS EXPIRE
+# Credentials  ← set AMAZON_JOBS_COOKIES / AMAZON_JOBS_API_KEY when sessions expire
 # ===========================================================================
 
-# Paste the full value of the `Cookie:` header from a fresh browser session.
-SESSION_COOKIES = (
-    "__Host-mons-sid=260-2550924-0570550; "
-    "__Host-mons-ubid=262-0037532-5168608; "
-    "__Host-mons-st=gN4orpN4C6Sgg+MHHhKcI4TLacIAruN1YmcdNT6/SkN+knKOZWRf+3UlZO2JM2Ws"
-    "JMSNoo6tVfzQ/Qml/dxIh8PkmpfrW3NPLY7FqY47mhnJVQt6MzNmASsBFul9p4Nc9yYYXnpDf7Qe3+"
-    "xFmtwKduRRSLIC5xYCs241zVIMp6xTpcaID4iPSrlMsk133Zz24MAMPrikwiChukorZV8uZoK9pi0Bx+"
-    "/r82TuXY/LhnQ=; "
-    "cwr_u=137cea49-1399-4d6c-8f86-0d6f6c6fa296; "
-    "_gcl_au=1.1.620961753.1777125995; "
-    "_ga=GA1.1.1027212620.1777125996"
-)
-
-# Paste the value of the `x-api-key:` header from a fresh browser session.
-API_KEY = "PbxxNwIlTi4FP5oijKdtk3IrBF5CLd4R4oPHsKNh"
+SESSION_COOKIES = os.getenv("AMAZON_JOBS_COOKIES", "")
+API_KEY         = os.getenv("AMAZON_JOBS_API_KEY", "")
 
 # ===========================================================================
 # API constants
@@ -268,6 +261,11 @@ async def scrape_amazon(target_url: str) -> list[dict]:
     Without this check we'd make one extra round-trip, get 0 results, and
     stop — which works but wastes a request. Early exit is cleaner.
     """
+    if not SESSION_COOKIES or not API_KEY:
+        print("[Amazon] Skipped: set AMAZON_JOBS_COOKIES and AMAZON_JOBS_API_KEY "
+              "(see the note at the top of scrapers/amazon.py).")
+        return []
+
     all_jobs:  list[dict] = []
     seen_urls: set[str]   = set()
 

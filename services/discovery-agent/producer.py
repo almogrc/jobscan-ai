@@ -7,8 +7,8 @@ Responsibilities (single):
   The producer does NOT scrape. It does NOT know what a scraper is.
   It is a dumb dispatcher that hands work to workers.
 
-Usage:
-    python -m infrastructure.queue_system.producer
+Usage (from services/discovery-agent):
+    python producer.py
 """
 
 import os
@@ -22,10 +22,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
 sys.path.append(root_dir)
 
-os.environ.setdefault("PUBSUB_EMULATOR_HOST", "localhost:8085")
-
 from infrastructure.queue_system.gcp_pubsub import GCPPubSubClient   # noqa: E402
-from infrastructure.db.db_operations import get_sites, seed_initial_sites  # noqa: E402
+from infrastructure.db.db_operations import ensure_schema, get_sites, seed_initial_sites  # noqa: E402
 
 TOPIC_NAME = "links-topic"
 SUB_NAME   = "scraper-worker-sub"
@@ -33,6 +31,8 @@ SUB_NAME   = "scraper-worker-sub"
 
 def run_producer() -> None:
     print("[Producer] Starting...")
+
+    ensure_schema()
 
     # Seed the DB if it's empty (idempotent — safe to call every time).
     seed_initial_sites()
@@ -55,12 +55,12 @@ def run_producer() -> None:
     failed    = 0
 
     for site in active_sites:
-        # Each message is a plain dict: {id, name, url}.
+        # Each message is a plain dict: {id, name, url, company}.
         # The worker is responsible for knowing what to do with each site.
         # We keep the message schema minimal and stable.
         try:
             msg_id = pubsub.publish_message(TOPIC_NAME, site)
-            print(f"[Producer]   ✓ Published '{site['name']}' (site_id={site['id']}) → msg_id={msg_id}")
+            print(f"[Producer]   ✓ Published '{site['company'] or site['name']}' (site_id={site['id']}) → msg_id={msg_id}")
             published += 1
         except Exception as e:
             # One failed publish should not kill the whole run.

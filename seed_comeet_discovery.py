@@ -1,13 +1,14 @@
 """
-seed_sites.py — Insert all known tech company job sources into TargetSite.
+seed_comeet_discovery.py — Insert all known tech company job sources into TargetSite.
 
-Place this file at the project root and run:
-    python seed_sites.py
+Run from the project root:
+    python seed_comeet_discovery.py
 
-Idempotent: existing rows (matched by base_url) are skipped, not duplicated.
-Safe to run multiple times.
+Idempotent: existing rows (matched by base_url) are kept, not duplicated; a
+row without a company name gets it filled in. Safe to run multiple times.
 
 SITES format: (display_label, name, base_url)
+  display  → stored as TargetSite.company (the name you see in reports)
   name     → routes the worker factory to the correct scraper
   base_url → interpreted differently per scraper:
                comeet     → "uid|token"
@@ -78,7 +79,6 @@ SITES = [
     ("Liveu",             "comeet", "90.00C|9C2709C1D43A827030C3A82709C"),
     ("Biocatch",             "comeet", "03.00E|30EF4630E92A1562156292A92A61C92A"),
     ("Playstudios",             "comeet", "E2.00B|2EBE972EB0146D8C1E971182E975D6"),
-    ("Biocatch",             "comeet", "03.00E|30EF4630E92A1562156292A92A61C92A"),
     ("Solaredge",             "comeet", "71.00A|17A5E8762BD08DC46E46E46E046E"),
     ("Appsforce",             "comeet", "09.00C|90C3648516C90C2430516C3F541218516C1218"),
     ("Rapyd",                "comeet", "73.00E|37E11766FC1F6E11761F6E6FC01BF06FC"),
@@ -90,7 +90,6 @@ SITES = [
     ("Infinidat",                "comeet", "D6.003|6D328F2DA6221F221F221F221F002FC5"),
     ("Gloat",                "comeet", "E5.000|5E02340002F0017800234011A01780"),
     ("Silverfort",                "comeet", "54.007|45715B315B38AE22B8D051A0A457D051E61"),
-    ("Gloat",                "comeet", "E5.000|5E02340002F0017800234011A01780"),
     ("Mitiga",                "comeet", "26.00B|62B250262B012811ED718AC128112813158"),
     ("Recruitingteam",                "comeet", "F3.00B|3FB13E7FEC13E70BF1BF13FB13E7BF1"),
     # Lusha  — verified: comeet.com/jobs/lusha/73.00B
@@ -203,8 +202,15 @@ def seed() -> None:
     try:
         inserted = 0
         skipped  = 0
+        named    = 0
+        seen: set[str] = set()
 
         for display, name, base_url in SITES:
+            if base_url in seen:
+                print(f"  [dup]    {display} is listed twice in SITES — skipped")
+                continue
+            seen.add(base_url)
+
             exists = (
                 db.query(TargetSite)
                 .filter(TargetSite.base_url == base_url)
@@ -212,16 +218,19 @@ def seed() -> None:
             )
 
             if exists:
+                if not exists.company:
+                    exists.company = display
+                    named += 1
                 print(f"  [skip]   {display} already in DB (id={exists.id})")
                 skipped += 1
                 continue
 
-            db.add(TargetSite(name=name, base_url=base_url, is_active=True))
+            db.add(TargetSite(name=name, company=display, base_url=base_url, is_active=True))
             print(f"  [insert] {display}  →  name='{name}'  base_url='{base_url}'")
             inserted += 1
 
         db.commit()
-        print(f"\n✅ Done. {inserted} inserted, {skipped} skipped.")
+        print(f"\n✅ Done. {inserted} inserted, {skipped} skipped, {named} named.")
 
     except Exception as e:
         db.rollback()

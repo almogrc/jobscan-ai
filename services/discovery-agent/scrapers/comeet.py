@@ -13,10 +13,11 @@ Public API (the only symbol worker.py needs):
     e.g.  "41.00B|14B52C52C67790D3E1296BA37C20"
 
 Each returned dict has exactly these keys (matching the Job model schema):
-    title     : str  — job.name
-    url       : str  — job.url_active_page  (fallback: url_comeet_hosted_page)
-    location  : str  — job.location.name
-    job_hash  : str  — job.uid
+    title       : str  — job.name
+    url         : str  — the position's own page on Comeet (see _position_url)
+    location    : str  — job.location.name
+    job_hash    : str  — job.uid
+    description : str  — the `details` sections as plain text
 
 Only Israel-based positions (location.country == "IL") are returned.
 
@@ -25,10 +26,10 @@ Dependencies:
 """
 
 import asyncio
-import random
 
 import aiohttp
-from bs4 import BeautifulSoup
+
+from scrapers.common import html_to_text
 
 # ===========================================================================
 # API constants
@@ -84,11 +85,24 @@ def _parse_target_url(target_url: str) -> tuple[str, str] | None:
     return company_id, token
 
 
-def _strip_html(html: str) -> str:
-    """Strip HTML tags from a Comeet description field → plain text."""
-    if not html:
-        return ""
-    return BeautifulSoup(html, "lxml").get_text(separator=" ", strip=True)
+def _position_url(job: dict) -> str:
+    """
+    The position's own page.
+
+    WHY NOT url_active_page FIRST?
+    Comeet documents url_active_page as "either on the company's website or on
+    the Recruit-hosted website". For some companies (OurCrowd in our DB) it is
+    just their generic careers page, the same URL for every position, so the
+    DB kept one job and dropped the rest. The hosted page is per position.
+    Comeet is renaming url_comeet_hosted_page to url_recruit_hosted_page, so
+    both names are read.
+    """
+    return (
+        job.get("url_recruit_hosted_page")
+        or job.get("url_comeet_hosted_page")
+        or job.get("url_active_page")
+        or ""
+    ).strip()
 
 
 # ===========================================================================
@@ -107,13 +121,9 @@ def _map_job(job: dict) -> dict | None:
 
     Returns None if the job is missing the minimum required fields.
     """
-    title = job.get("name", "").strip()
+    title = (job.get("name") or "").strip()
 
-    url = (
-        job.get("url_active_page")
-        or job.get("url_comeet_hosted_page")
-        or ""
-    ).strip()
+    url = _position_url(job)
 
     if not title or not url:
         return None
@@ -133,8 +143,8 @@ def _map_job(job: dict) -> dict | None:
         if heading:
             desc_parts.append(heading)
         if html:
-            desc_parts.append(_strip_html(html))
-    description = " ".join(desc_parts).strip()
+            desc_parts.append(html_to_text(html))
+    description = "\n".join(desc_parts).strip()
 
     return {
         "title":       title,
@@ -157,7 +167,7 @@ async def scrape_comeet(target_url: str) -> list[dict]:
         target_url: "<company_id>|<token>" string from TargetSite.base_url.
 
     Returns:
-        List of job dicts [{title, url, location, job_hash}, ...].
+        List of job dicts [{title, url, location, job_hash, description}, ...].
         Returns an empty list (never raises) so the worker can ack/nack
         based on the return value rather than catching exceptions here.
 
