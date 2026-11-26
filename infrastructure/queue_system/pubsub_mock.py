@@ -26,5 +26,5 @@ class LocalPubSub:
         q = self._get_or_create_topic(topic_name)
         q.task_done()
         
-    def nack(self, topic_name: str, message: dict): # Crash
+    def nack(self, topic_name: str, message: dict, site_id: str, is_system_error): # Crash
         self.publish(topic_name, message)

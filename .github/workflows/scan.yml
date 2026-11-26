@@ -1,0 +1,59 @@
+# Scans every company twice a day on GitHub's servers and saves the results to the
+# `data` branch (jobs.db + jobs.csv). Free for public repositories.
+#
+# Run it by hand: GitHub → Actions → "Scan jobs" → Run workflow.
+# Scheduled runs only start from the default branch (main), so this file must be on main.
+name: Scan jobs
+
+on:
+  schedule:
+    - cron: "17 4,16 * * *"     # 06:17 and 18:17 Israel time in winter (07:17 / 19:17 in summer)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write                # needed to push the data branch
+
+concurrency:
+  group: scan-jobs
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install what the scan needs
+        run: pip install "aiohttp>=3.9,<4" "beautifulsoup4>=4.12" "lxml>=5.0" "SQLAlchemy>=2.0,<2.1"
+
+      - name: Restore the database from the last run
+        run: |
+          if git fetch --depth 1 origin data:refs/remotes/origin/data; then
+            git show origin/data:jobs.db > infrastructure/db/jobs.db
+            echo "Restored jobs.db from the data branch."
+          else
+            echo "No data branch yet: starting with an empty database."
+          fi
+
+      - name: Scan
+        run: python run_scan.py
+
+      - name: Save jobs.db and jobs.csv to the data branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/data
+          cp infrastructure/db/jobs.db infrastructure/db/jobs.csv /tmp/data/
+          cd /tmp/data
+          git init -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add jobs.db jobs.csv
+          git commit -q -m "Jobs scan $(date -u +'%Y-%m-%d %H:%M') UTC"
+          # One commit, replaced every run, so the repo doesn't grow with old copies.
+          git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
