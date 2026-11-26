@@ -46,6 +46,18 @@ flowchart LR
 
 Companies live in `seed_comeet_discovery.py`. Adding one is a new row there, no code change.
 
+## Runs in the cloud (GitHub Actions)
+
+`.github/workflows/scan.yml` runs `run_scan.py` on GitHub's servers twice a day
+(06:17 and 18:17 Israel time) and whenever you press **Actions → Scan jobs → Run
+workflow**. It's free for public repositories and needs no cloud account or Docker.
+
+Each run restores the last `jobs.db` from the `data` branch, scans every company with
+the same scrapers as the worker, and saves `jobs.db` and `jobs.csv` back to `data`.
+`jobs.csv` lists the open jobs (company, title, location, first seen, link) and can be
+read on GitHub, phone included. Scheduled runs start only from the default branch,
+so the workflow has to be on `main`.
+
 ## Run it locally
 
 Needs Python 3.10+ and the Pub/Sub emulator (part of the gcloud CLI).
@@ -92,6 +104,7 @@ and the database tests use a throwaway SQLite file.
 
 - `services/matcher-service`: score each open role against a candidate profile
   (must-have vs nice-to-have skills, years of experience) in both directions.
-- Deploy to Google Cloud: Cloud Run for the worker, Cloud Scheduler for the producer,
-  Cloud SQL for Postgres, and a dead-letter topic for messages that keep failing.
+- Move the scan from GitHub Actions to Google Cloud when it outgrows it: Cloud Run for
+  the worker, Cloud Scheduler for the producer, Cloud SQL for Postgres, and a
+  dead-letter topic for messages that keep failing.
 - `services/api-server`: an API for the matches.

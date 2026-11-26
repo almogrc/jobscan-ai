@@ -1,5 +1,8 @@
 # fix/cloud-ready — review of feature/scraper-factory (25 Nov 2026)
 
+Also adds `run_scan.py` and `.github/workflows/scan.yml`: the whole scan runs on
+GitHub Actions twice a day and saves `jobs.db` + `jobs.csv` to a `data` branch.
+
 Reviewed branch `feature/scraper-factory` at commit `c0503bf`. Each bug below was
 confirmed against the original code: by running it for 1, 4, 6, 7 and 8, and by reading
 it next to the vendor docs for the rest. The new worker and build tests fail on the old
@@ -63,3 +66,5 @@ Smaller: unused `import random` in `comeet.py`; docstrings that pointed at old p
    during the review (SQLAlchemy couldn't be installed there), so they're the first
    thing to check.
 4. Run the worker and producer as before (see README).
+5. Cloud: merge this branch into `main`, then GitHub → Actions → "Scan jobs" → Run
+   workflow. After that it runs twice a day by itself (README, "Runs in the cloud").
